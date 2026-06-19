@@ -13,15 +13,15 @@
 #include <vector>
 #include <string>
 #include <iostream>
+#include <algorithm>
 
-// Per-instance data layout uploaded to GPU
 struct InstanceData {
-    glm::vec2 pos;          // 2D screen position after projection (computed on CPU)
-    glm::vec2 size;         // pixel size of this glyph quad
+    glm::vec2 pos;
+    glm::vec2 size;
     glm::vec2 uvMin;
     glm::vec2 uvMax;
     glm::vec4 color;
-    float     glitchOffset; // horizontal pixel jitter
+    float     glitchOffset;
 };
 
 class Renderer {
@@ -31,7 +31,6 @@ public:
     GlyphAtlas* atlas = nullptr;
     int screenW = 0, screenH = 0;
 
-    // Projection + view matrices
     glm::mat4 projection;
     glm::mat4 view;
 
@@ -42,7 +41,6 @@ public:
         screenH = sh;
         atlas   = a;
 
-        // ── Compile shaders ───────────────────────────────────────────────────
         shaderProgram = ShaderUtils::loadFromFiles(
             "shaders/glyph.vert",
             "shaders/glyph.frag"
@@ -52,9 +50,7 @@ public:
             return false;
         }
 
-        // ── Unit quad (two triangles, 0..1 UV space) ──────────────────────────
         float quad[] = {
-            // pos      UV
             0.0f, 0.0f,  0.0f, 0.0f,
             1.0f, 0.0f,  1.0f, 0.0f,
             1.0f, 1.0f,  1.0f, 1.0f,
@@ -69,24 +65,20 @@ public:
         glGenBuffers(1, &VBO_quad);
         glBindBuffer(GL_ARRAY_BUFFER, VBO_quad);
         glBufferData(GL_ARRAY_BUFFER, sizeof(quad), quad, GL_STATIC_DRAW);
-        // attrib 0: pos2D
         glEnableVertexAttribArray(0);
         glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)0);
-        // attrib 1: uv
         glEnableVertexAttribArray(1);
         glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)(2 * sizeof(float)));
 
-        // ── Instance VBO ──────────────────────────────────────────────────────
         glGenBuffers(1, &VBO_instance);
         glBindBuffer(GL_ARRAY_BUFFER, VBO_instance);
         glBufferData(GL_ARRAY_BUFFER, MAX_INSTANCES * sizeof(InstanceData), nullptr, GL_DYNAMIC_DRAW);
 
-        // Layout: (see InstanceData struct)
         size_t stride = sizeof(InstanceData);
         auto va = [&](GLuint idx, int count, size_t offset) {
             glEnableVertexAttribArray(idx);
             glVertexAttribPointer(idx, count, GL_FLOAT, GL_FALSE, (GLsizei)stride, (void*)offset);
-            glVertexAttribDivisor(idx, 1); // one per instance
+            glVertexAttribDivisor(idx, 1);
         };
         va(2, 2, offsetof(InstanceData, pos));
         va(3, 2, offsetof(InstanceData, size));
@@ -97,14 +89,13 @@ public:
 
         glBindVertexArray(0);
 
-        // ── Projection: perspective, camera looking down -Z ───────────────────
-        float fov  = glm::radians(60.0f);
+        float fov    = glm::radians(60.0f);
         float aspect = (float)sw / (float)sh;
-        projection = glm::perspective(fov, aspect, 0.1f, 50.0f);
-        view = glm::lookAt(
-            glm::vec3(0, 0, 12.0f),  // camera position
-            glm::vec3(0, 0, 0),      // look at origin
-            glm::vec3(0, 1, 0)       // up
+        projection   = glm::perspective(fov, aspect, 0.1f, 50.0f);
+        view         = glm::lookAt(
+            glm::vec3(0, 0, 12.0f),
+            glm::vec3(0, 0, 0),
+            glm::vec3(0, 1, 0)
         );
 
         return true;
@@ -113,19 +104,23 @@ public:
     void draw(const ColumnManager& cm, float time) {
         if (!shaderProgram) return;
 
-        // ── Build instance buffer from column data ─────────────────────────────
         std::vector<InstanceData> instances;
         instances.reserve(4096);
 
         glm::mat4 vp = projection * view;
 
-        int colIdx = 0;
+        // Darker green palette
+        const glm::vec3 COLOR_HEAD = glm::vec3(0.55f, 0.95f, 0.55f); // pale green
+        const glm::vec3 COLOR_MID  = glm::vec3(0.05f, 0.75f, 0.25f); // mid green
+        const glm::vec3 COLOR_DARK = glm::vec3(0.02f, 0.40f, 0.12f); // dark green
+        const glm::vec3 COLOR_CYAN = glm::vec3(0.00f, 0.60f, 0.65f); // cyan accent
+
         for (const auto& col : cm.getColumns()) {
             float glyphStep = 0.45f * col.depthScale();
+
             for (int i = 0; i < (int)col.chars.size(); ++i) {
                 float gy = col.y + i * glyphStep;
 
-                // Project 3D position to NDC, then to screen pixels
                 glm::vec4 clip = vp * glm::vec4(col.x, gy, col.z, 1.0f);
                 if (clip.w <= 0.0f) continue;
                 glm::vec3 ndc = glm::vec3(clip) / clip.w;
@@ -138,55 +133,50 @@ public:
                 const GlyphInfo* g = atlas->getGlyph(col.chars[i]);
                 if (!g) continue;
 
+                // 28pt bitmaps * 2.2 scale gives readable glyph size
                 float scale = col.depthScale() * 2.2f;
-                float gw = g->size.x * scale;
-                float gh = g->size.y * scale;
+                float gw    = g->size.x * scale;
+                float gh    = g->size.y * scale;
+                if (gw < 1.0f || gh < 1.0f) continue;
+
+                float t = (float)i / (float)col.chars.size();
+                glm::vec3 rgb;
+                if (i == 0) {
+                    rgb = COLOR_HEAD;
+                } else if (t < 0.2f) {
+                    rgb = glm::mix(COLOR_HEAD, COLOR_MID, t / 0.2f);
+                } else {
+                    bool isCyan = ((int)(col.x * 3.7f) % 7 == 0);
+                    glm::vec3 tail = isCyan ? COLOR_CYAN : COLOR_DARK;
+                    rgb = glm::mix(COLOR_MID, tail, std::min((t - 0.2f) / 0.8f, 1.0f));
+                }
+
+                // Alpha: 0.75 ceiling, fades toward tail
+                float alpha = col.depthAlpha() * 0.75f * (1.0f - std::pow(t, 1.8f));
+                if (alpha < 0.01f) continue;
 
                 InstanceData inst;
                 inst.pos          = glm::vec2(sx - gw * 0.5f, sy - gh * 0.5f);
                 inst.size         = glm::vec2(gw, gh);
                 inst.uvMin        = g->uvMin;
                 inst.uvMax        = g->uvMax;
+                inst.color        = glm::vec4(rgb, alpha);
                 inst.glitchOffset = 0.0f;
-                inst.color        = glm::vec4(1); // will be overridden below
-
-                // Color from column manager instances (parallel array)
-                // For simplicity we replicate color logic here:
-                float t = (float)i / (float)col.chars.size();
-                glm::vec3 rgb;
-                if (i == 0) {
-                    rgb = glm::vec3(0.95f, 1.0f, 0.95f); // bright white head
-                } else if (t < 0.2f) {
-                    rgb = glm::mix(glm::vec3(0.9f, 1.0f, 0.9f),
-                                   glm::vec3(0.05f, 0.9f, 0.35f), t / 0.2f);
-                } else {
-                    bool isCyan = ((int)(col.x * 3.7f) % 7 == 0);
-                    glm::vec3 tail = isCyan ? glm::vec3(0.0f, 0.85f, 0.9f)
-                                           : glm::vec3(0.05f, 0.9f, 0.35f);
-                    rgb = glm::mix(tail, glm::vec3(0.0f), std::min(t * 0.9f, 1.0f));
-                }
-                // Alpha stays high longer before dropping at the tail
-                float alpha = col.depthAlpha() * (1.0f - std::pow(t, 1.5f) * 0.85f);
-                inst.color = glm::vec4(rgb, alpha);
 
                 instances.push_back(inst);
-                if (instances.size() >= MAX_INSTANCES) goto doneBuilding;
+                if ((int)instances.size() >= MAX_INSTANCES) goto doneBuilding;
             }
-            ++colIdx;
         }
         doneBuilding:;
 
         if (instances.empty()) return;
 
-        // ── Upload to GPU ──────────────────────────────────────────────────────
         glBindBuffer(GL_ARRAY_BUFFER, VBO_instance);
         glBufferSubData(GL_ARRAY_BUFFER, 0,
             instances.size() * sizeof(InstanceData), instances.data());
 
-        // ── Draw ──────────────────────────────────────────────────────────────
         glUseProgram(shaderProgram);
 
-        // Orthographic projection for screen-space quad rendering
         glm::mat4 ortho = glm::ortho(0.0f, (float)screenW, (float)screenH, 0.0f, -1.0f, 1.0f);
         glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "uOrtho"),
                            1, GL_FALSE, glm::value_ptr(ortho));
